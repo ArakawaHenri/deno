@@ -208,94 +208,101 @@ async fn bench_specifier_inner(
     )
     .await?;
 
-  worker.execute_preload_modules().await?;
-  // We execute the main module as a side module so that import.meta.main is not set.
-  worker.execute_side_module().await?;
-
+  let load_result = async {
+    worker.execute_preload_modules().await?;
+    // The main module is a side module so that import.meta.main is not set.
+    worker.execute_side_module().await
+  }
+  .await;
   let mut worker = worker.into_main_worker();
+  let result = async {
+    load_result?;
 
-  // Ensure that there are no pending exceptions before we start running tests
-  worker.run_up_to_duration(Duration::from_millis(0)).await?;
+    // Ensure that there are no pending exceptions before we start running tests
+    worker.run_up_to_duration(Duration::from_millis(0)).await?;
 
-  worker
-    .dispatch_load_event()
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    worker
+      .dispatch_load_event()
+      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
 
-  let benchmarks = {
-    let state_rc = worker.js_runtime.op_state();
-    let mut state = state_rc.borrow_mut();
-    std::mem::take(&mut state.borrow_mut::<ops::bench::BenchContainer>().0)
-  };
-  let (only, no_only): (Vec<_>, Vec<_>) =
-    benchmarks.into_iter().partition(|(d, _)| d.only);
-  let used_only = !only.is_empty();
-  let benchmarks = if used_only { only } else { no_only };
-  let mut benchmarks = benchmarks
-    .into_iter()
-    .filter(|(d, _)| d.warmup || filter.includes(&d.name) && !d.ignore)
-    .collect::<Vec<_>>();
-  let mut groups = IndexSet::<Option<String>>::new();
-  // make sure ungrouped benchmarks are placed above grouped
-  groups.insert(None);
-  for (desc, _) in &benchmarks {
-    groups.insert(desc.group.clone());
-  }
-  benchmarks.sort_by(|(d1, _), (d2, _)| {
-    groups
-      .get_index_of(&d1.group)
-      .unwrap()
-      .partial_cmp(&groups.get_index_of(&d2.group).unwrap())
-      .unwrap()
-  });
-  sender
-    .send(BenchEvent::Plan(BenchPlan {
-      origin: specifier.to_string(),
-      total: benchmarks.len(),
-      used_only,
-      names: benchmarks.iter().map(|(d, _)| d.name.clone()).collect(),
-    }))
-    .map_err(JsErrorBox::from_err)
-    .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
-  for (desc, function) in benchmarks {
+    let benchmarks = {
+      let state_rc = worker.js_runtime.op_state();
+      let mut state = state_rc.borrow_mut();
+      std::mem::take(&mut state.borrow_mut::<ops::bench::BenchContainer>().0)
+    };
+    let (only, no_only): (Vec<_>, Vec<_>) =
+      benchmarks.into_iter().partition(|(d, _)| d.only);
+    let used_only = !only.is_empty();
+    let benchmarks = if used_only { only } else { no_only };
+    let mut benchmarks = benchmarks
+      .into_iter()
+      .filter(|(d, _)| d.warmup || filter.includes(&d.name) && !d.ignore)
+      .collect::<Vec<_>>();
+    let mut groups = IndexSet::<Option<String>>::new();
+    // make sure ungrouped benchmarks are placed above grouped
+    groups.insert(None);
+    for (desc, _) in &benchmarks {
+      groups.insert(desc.group.clone());
+    }
+    benchmarks.sort_by(|(d1, _), (d2, _)| {
+      groups
+        .get_index_of(&d1.group)
+        .unwrap()
+        .partial_cmp(&groups.get_index_of(&d2.group).unwrap())
+        .unwrap()
+    });
     sender
-      .send(BenchEvent::Wait(desc.id))
+      .send(BenchEvent::Plan(BenchPlan {
+        origin: specifier.to_string(),
+        total: benchmarks.len(),
+        used_only,
+        names: benchmarks.iter().map(|(d, _)| d.name.clone()).collect(),
+      }))
       .map_err(JsErrorBox::from_err)
       .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
-    let call = worker.js_runtime.call(&function);
-    let result = worker
-      .js_runtime
-      .with_event_loop_promise(call, PollEventLoopOptions::default())
-      .await?;
-    deno_core::scope!(scope, &mut worker.js_runtime);
-    let result = v8::Local::new(scope, result);
-    let result = BenchResult::from_v8(scope, result)
-      .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
-    sender
-      .send(BenchEvent::Result(desc.id, result))
-      .map_err(JsErrorBox::from_err)
-      .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
-  }
+    for (desc, function) in benchmarks {
+      sender
+        .send(BenchEvent::Wait(desc.id))
+        .map_err(JsErrorBox::from_err)
+        .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
+      let call = worker.js_runtime.call(&function);
+      let result = worker
+        .js_runtime
+        .with_event_loop_promise(call, PollEventLoopOptions::default())
+        .await?;
+      deno_core::scope!(scope, &mut worker.js_runtime);
+      let result = v8::Local::new(scope, result);
+      let result = BenchResult::from_v8(scope, result)
+        .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
+      sender
+        .send(BenchEvent::Result(desc.id, result))
+        .map_err(JsErrorBox::from_err)
+        .map_err(|e| CoreErrorKind::JsBox(e).into_box())?;
+    }
 
-  // Ignore `defaultPrevented` of the `beforeunload` event. We don't allow the
-  // event loop to continue beyond what's needed to await results.
-  worker
-    .dispatch_beforeunload_event()
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  worker
-    .dispatch_process_beforeexit_event()
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  worker
-    .dispatch_unload_event()
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  worker
-    .dispatch_process_exit_event()
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  // Ensure the worker has settled so we can catch any remaining unhandled rejections. We don't
-  // want to wait forever here.
-  worker.run_up_to_duration(Duration::from_millis(0)).await?;
+    // Ignore `defaultPrevented` of the `beforeunload` event. We don't allow the
+    // event loop to continue beyond what's needed to await results.
+    worker
+      .dispatch_beforeunload_event()
+      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    worker
+      .dispatch_process_beforeexit_event()
+      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    worker
+      .dispatch_unload_event()
+      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    worker
+      .dispatch_process_exit_event()
+      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    // Ensure the worker has settled so we can catch any remaining unhandled rejections. We don't
+    // want to wait forever here.
+    worker.run_up_to_duration(Duration::from_millis(0)).await?;
+
+    Ok(())
+  }
+  .await;
   worker.shutdown_napi().await;
-
-  Ok(())
+  result
 }
 
 /// Test a collection of specifiers with test modes concurrently.

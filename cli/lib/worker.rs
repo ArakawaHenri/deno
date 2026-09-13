@@ -1025,6 +1025,14 @@ impl LibMainWorker {
   pub async fn run_event_loop_to_completion(
     &mut self,
   ) -> Result<i32, CoreError> {
+    let result = self.run_event_loop_to_completion_inner().await;
+    self.worker.shutdown_napi().await;
+    result
+  }
+
+  async fn run_event_loop_to_completion_inner(
+    &mut self,
+  ) -> Result<i32, CoreError> {
     loop {
       self
         .worker
@@ -1042,7 +1050,6 @@ impl LibMainWorker {
 
     self.worker.dispatch_unload_event()?;
     self.worker.dispatch_process_exit_event()?;
-    self.worker.shutdown_napi().await;
 
     Ok(self.worker.exit_code())
   }
@@ -1050,8 +1057,13 @@ impl LibMainWorker {
   pub async fn run(&mut self) -> Result<i32, CoreError> {
     log::debug!("main_module {}", self.main_module);
 
-    self.execute_load_phase().await?;
-    self.run_event_loop_to_completion().await
+    let result = async {
+      self.execute_load_phase().await?;
+      self.run_event_loop_to_completion_inner().await
+    }
+    .await;
+    self.worker.shutdown_napi().await;
+    result
   }
 
   #[inline]

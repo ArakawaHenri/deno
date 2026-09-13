@@ -12,6 +12,11 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[[example]]
+name = "napi_version_10"
+path = "src/version_10.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
 libuv-sys-lite.workspace = true
 napi_sys.workspace = true

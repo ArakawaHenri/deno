@@ -233,8 +233,16 @@ macro_rules! napi_wrap {
     $vis unsafe extern "C" fn $name $( < $( $x ),* > )? ( env_ptr : *mut Env , $( $ident : $ty ),* ) -> napi_status {
       let env: & $( $lt )? mut Env = $crate::check_env!(env_ptr);
 
-      if env.last_exception.is_some() || env.closing {
+      if env.last_exception.is_some() {
         return $crate::util::napi_set_last_error(env_ptr, napi_pending_exception);
+      }
+      if env.closing {
+        let status = if env.module_api_version >= 10 {
+          napi_cannot_run_js
+        } else {
+          napi_pending_exception
+        };
+        return $crate::util::napi_set_last_error(env_ptr, status);
       }
 
       $crate::util::napi_clear_last_error(env);

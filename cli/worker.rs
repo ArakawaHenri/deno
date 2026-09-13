@@ -78,6 +78,12 @@ impl CliMainWorker {
   }
 
   pub async fn run(&mut self) -> Result<i32, CoreError> {
+    let result = self.run_inner().await;
+    self.worker.shutdown_napi().await;
+    result
+  }
+
+  async fn run_inner(&mut self) -> Result<i32, CoreError> {
     let maybe_coverage_collector = self.maybe_setup_coverage_collector();
     let maybe_cpu_profiler = self.maybe_setup_cpu_profiler();
     let mut maybe_hmr_runner = self.maybe_setup_hmr_runner();
@@ -272,7 +278,6 @@ impl CliMainWorker {
 
     self.worker.dispatch_unload_event()?;
     self.worker.dispatch_process_exit_event()?;
-    self.worker.shutdown_napi().await;
 
     Ok(())
   }
@@ -339,23 +344,28 @@ impl CliMainWorker {
 
         self.inner.worker.dispatch_unload_event()?;
         self.inner.worker.dispatch_process_exit_event()?;
-        self.inner.worker.shutdown_napi().await;
 
         Ok(())
       }
-    }
 
-    impl Drop for FileWatcherModuleExecutor {
-      fn drop(&mut self) {
-        if self.pending_unload {
+      fn dispatch_pending_unload(&mut self) {
+        if std::mem::take(&mut self.pending_unload) {
           let _ = self.inner.worker.dispatch_unload_event();
           let _ = self.inner.worker.dispatch_process_exit_event();
         }
       }
     }
 
+    impl Drop for FileWatcherModuleExecutor {
+      fn drop(&mut self) {
+        self.dispatch_pending_unload();
+      }
+    }
+
     let mut executor = FileWatcherModuleExecutor::new(self);
     let result = executor.execute().await;
+    executor.dispatch_pending_unload();
+    executor.inner.worker.shutdown_napi().await;
 
     // If the script called `Deno.exit()`, `op_exit` terminated the isolate
     // instead of the process. Treat it as a normal end of run: clear V8's

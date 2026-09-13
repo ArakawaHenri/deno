@@ -553,6 +553,9 @@ pub async fn shutdown(js_runtime: &mut deno_core::JsRuntime) {
     napi.begin_shutdown();
     (napi.env_cleanup_hooks.clone(), napi.async_cleanup.clone())
   };
+  // Native cleanup needs a usable isolate after forced worker termination.
+  // The closing flag continues to prevent Node-API calls from entering JS.
+  js_runtime.v8_isolate().cancel_terminate_execution();
   loop {
     {
       deno_core::scope!(scope, js_runtime);
@@ -729,6 +732,7 @@ pub struct Env {
   cleanup_hooks: Rc<RefCell<Vec<(napi_cleanup_hook, *mut c_void)>>>,
   ref_tracker: Rc<RefCell<RefTracker>>,
   pub(crate) closing: bool,
+  pub(crate) module_api_version: i32,
   async_cleanup: Option<std::sync::Arc<AsyncCleanupTasks>>,
   external_ops_tracker: ExternalOpsTracker,
   pub last_error: napi_extended_error_info,
@@ -785,6 +789,7 @@ impl Env {
       cleanup_hooks,
       ref_tracker,
       closing,
+      module_api_version: 8,
       async_cleanup: Some(async_cleanup),
       external_ops_tracker,
       last_error: napi_extended_error_info {
@@ -1231,6 +1236,20 @@ fn op_napi_open<'scope>(
     let mut slot = cell.borrow_mut();
     slot.take()
   });
+
+  // The registration ABI version is independent of the addon's Node-API version.
+  let module_api_version = unsafe {
+    library
+      .get::<unsafe extern "C" fn() -> i32>(
+        b"node_api_module_get_api_version_v1",
+      )
+      .map(|get_version| get_version())
+      .unwrap_or(8)
+  };
+  // SAFETY: this environment has not yet been passed to the addon initializer.
+  unsafe {
+    (*(env_ptr as *mut Env)).module_api_version = module_api_version.max(8);
+  }
 
   // The `module.exports` object.
   let exports = v8::Object::new(scope);

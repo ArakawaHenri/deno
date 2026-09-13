@@ -1499,3 +1499,33 @@ Deno.test("[node/worker_threads] postMessage of non-serializable value throws", 
     await worker.terminate();
   }
 });
+
+Deno.test("[node/worker_threads] terminate during startup and synchronous execution", async () => {
+  for (const waitUntilRunning of [false, true]) {
+    const worker = new workerThreads.Worker(
+      `
+        const { parentPort } = require("node:worker_threads");
+        require("node:timers");
+        parentPort.postMessage("ready");
+        for (;;) {}
+      `,
+      { eval: true },
+    );
+    const errors = [];
+    let exits = 0;
+    worker.on("error", (error) => errors.push(error));
+    worker.on("exit", () => exits++);
+    try {
+      if (waitUntilRunning) await once(worker, "message");
+      const first = worker.terminate();
+      const second = worker.terminate();
+      assertEquals(await first, 1);
+      assertEquals(await second, 1);
+      assertEquals(exits, 1);
+      assertEquals(errors, []);
+      assertEquals(await worker.terminate(), undefined);
+    } finally {
+      await worker.terminate();
+    }
+  }
+});

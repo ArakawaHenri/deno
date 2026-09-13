@@ -3,6 +3,7 @@
 export { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 export { fromFileUrl } from "@std/path";
 import process from "node:process";
+import { basename, dirname } from "@std/path";
 
 const targetDir = Deno.execPath().replace(/[^\/\\]+$/, "");
 export const [libPrefix, libSuffix] = {
@@ -11,8 +12,10 @@ export const [libPrefix, libSuffix] = {
   windows: ["", "dll"],
 }[Deno.build.os];
 
-export function loadTestLibrary() {
-  const specifier = `${targetDir}/${libPrefix}test_napi.${libSuffix}`;
+export function loadTestLibrary(name = "test_napi") {
+  const specifier = `${targetDir}/${dirname(name)}/${libPrefix}${
+    basename(name)
+  }.${libSuffix}`;
 
   // Internal, used in ext/node
   const module = {};

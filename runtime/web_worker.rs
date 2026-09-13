@@ -1163,6 +1163,9 @@ async fn run_web_worker_inner(
 
   let name = worker.name.to_string();
   let mut internal_handle = worker.internal_handle.clone();
+  if internal_handle.terminate_if_needed() {
+    return Ok(());
+  }
 
   // If the bootstrap failed, report it as a terminal error.
   if let Some(error) = worker.bootstrap_error.take() {
@@ -1208,7 +1211,7 @@ async fn run_web_worker_inner(
 
   // If sender is closed it means that worker has already been closed from
   // within using "globalThis.close()"
-  if internal_handle.is_terminated() {
+  if internal_handle.terminate_if_needed() {
     if let Some(coverage_collector) = maybe_coverage_collector.as_mut() {
       coverage_collector.stop_collecting()?;
     }

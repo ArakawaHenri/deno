@@ -267,9 +267,10 @@ class NodeWorker extends EventEmitter {
   #messageLoopPromise = undefined;
   #workerOnline = false;
   #exited = false;
+  #terminationPromise = undefined;
   // "RUNNING" | "CLOSED" | "TERMINATED"
-  // "TERMINATED" means that any controls or messages received will be
-  // discarded. "CLOSED" means that we have received a control
+  // "TERMINATED" discards user messages while awaiting the exit notification.
+  // "CLOSED" means that we have received a control
   // indicating that the worker is no longer running, but there might
   // still be messages left to receive.
   #status = "RUNNING";
@@ -638,15 +639,12 @@ class NodeWorker extends EventEmitter {
       }
       const { 0: type, 1: data } = await this.#controlPromise;
 
-      // If terminate was called then we ignore all messages
-      if (this.#status === "TERMINATED") {
-        return;
-      }
+      const terminated = this.#status === "TERMINATED";
 
       switch (type) {
         case 1: { // TerminalError
-          this.#status = "CLOSED";
-          if (this.listenerCount("error") > 0) {
+          if (!terminated) this.#status = "CLOSED";
+          if (!terminated && this.listenerCount("error") > 0) {
             const errMsg = data.errorMessage ?? data.message;
             const errName = data.name;
             let err;
@@ -675,7 +673,7 @@ class NodeWorker extends EventEmitter {
           this.resourceLimits = {};
           if (!this.#exited) {
             this.#exited = true;
-            this.emit("exit", data.exitCode ?? 1);
+            this.emit("exit", terminated ? 1 : (data.exitCode ?? 1));
           }
           return;
         }
@@ -685,7 +683,7 @@ class NodeWorker extends EventEmitter {
         }
         case 3: { // Close
           debugWT(`Host got "close" message from worker: ${this.#name}`);
-          this.#status = "CLOSED";
+          if (!terminated) this.#status = "CLOSED";
           // Drain pending messages before closing stdio and emitting exit:
           // any stdio chunks still queued on the message channel must be
           // pushed onto the Readable streams *before* we EOF them, otherwise
@@ -696,7 +694,7 @@ class NodeWorker extends EventEmitter {
           this.resourceLimits = {};
           if (!this.#exited) {
             this.#exited = true;
-            this.emit("exit", data ?? 0);
+            this.emit("exit", terminated ? 1 : (data ?? 0));
           }
           return;
         }
@@ -827,23 +825,18 @@ class NodeWorker extends EventEmitter {
 
   // https://nodejs.org/api/worker_threads.html#workerterminate
   terminate() {
-    if (this.#status === "TERMINATED") {
+    if (this.#exited) {
       return PromiseResolve(undefined);
     }
+    if (this.#terminationPromise) return this.#terminationPromise;
 
+    this.ref();
+    this.#terminationPromise = new Promise((resolve) => {
+      this.once("exit", resolve);
+    });
     this.#status = "TERMINATED";
     op_host_terminate_worker(this.#id);
-    this.#closeStdio();
-
-    if (!this.#exited) {
-      this.#exited = true;
-      this.emit("exit", 1);
-      return PromiseResolve(1);
-    }
-
-    // Worker already exited - Node.js returns undefined in this case
-    // (the internal handle is already null).
-    return PromiseResolve(undefined);
+    return this.#terminationPromise;
   }
 
   async [SymbolAsyncDispose]() {

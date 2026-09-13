@@ -789,60 +789,62 @@ async fn configure_main_worker(
       None,
     )
     .await?;
-  let coverage_collector = worker.maybe_setup_coverage_collector();
-  // Store the isolate handle in OpState so that `op_test_isolate_exit` can
-  // ask V8 to terminate the isolate when user code calls `Deno.exit()`
-  // outside of any test function. Then install the default exit handler -
-  // both must be in place before user code (including preload / side
-  // modules) gets a chance to run.
-  let isolate_handle = worker.v8_isolate_handle();
-  worker
-    .op_state()
-    .borrow_mut()
-    .put(ops::testing::TestIsolateHandle(isolate_handle));
-  if options.update_snapshots {
-    // Authorizes `op_test_snapshot_write` for this isolate. Only ever set
-    // from the `--update-snapshots` CLI flag, never from JS.
+  let result = async {
+    let coverage_collector = worker.maybe_setup_coverage_collector();
+    // Store the isolate handle in OpState so that `op_test_isolate_exit` can
+    // ask V8 to terminate the isolate when user code calls `Deno.exit()`
+    // outside of any test function. Then install the default exit handler -
+    // both must be in place before user code (including preload / side
+    // modules) gets a chance to run.
+    let isolate_handle = worker.v8_isolate_handle();
     worker
       .op_state()
       .borrow_mut()
-      .put(ops::testing::SnapshotUpdateMode);
-  }
-  worker
-    .execute_script_static(
-      located_script_name!(),
-      "Deno[Deno.internal].installTestIsolateExitHandler();",
-    )
-    .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  if options.trace_leaks {
+      .put(ops::testing::TestIsolateHandle(isolate_handle));
+    if options.update_snapshots {
+      // Authorizes `op_test_snapshot_write` for this isolate. Only ever set
+      // from the `--update-snapshots` CLI flag, never from JS.
+      worker
+        .op_state()
+        .borrow_mut()
+        .put(ops::testing::SnapshotUpdateMode);
+    }
     worker
       .execute_script_static(
         located_script_name!(),
-        "Deno[Deno.internal].core.setLeakTracingEnabled(true);",
+        "Deno[Deno.internal].installTestIsolateExitHandler();",
       )
       .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  }
-  if options.sanitize_ops {
-    worker
-      .execute_script_static(
-        located_script_name!(),
-        "Deno[Deno.internal].testSanitizeOps = true;",
-      )
-      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  }
-  if options.sanitize_resources {
-    worker
-      .execute_script_static(
-        located_script_name!(),
-        "Deno[Deno.internal].testSanitizeResources = true;",
-      )
-      .map_err(|e| CoreErrorKind::Js(e).into_box())?;
-  }
+    if options.trace_leaks {
+      worker
+        .execute_script_static(
+          located_script_name!(),
+          "Deno[Deno.internal].core.setLeakTracingEnabled(true);",
+        )
+        .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    }
+    if options.sanitize_ops {
+      worker
+        .execute_script_static(
+          located_script_name!(),
+          "Deno[Deno.internal].testSanitizeOps = true;",
+        )
+        .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    }
+    if options.sanitize_resources {
+      worker
+        .execute_script_static(
+          located_script_name!(),
+          "Deno[Deno.internal].testSanitizeResources = true;",
+        )
+        .map_err(|e| CoreErrorKind::Js(e).into_box())?;
+    }
 
-  let op_state = worker.op_state();
+    let op_state = worker.op_state();
 
-  let check_res =
-    |res: Result<(), CoreError>| match res.map_err(|err| err.into_kind()) {
+    let check_res = |res: Result<(), CoreError>| match res
+      .map_err(|err| err.into_kind())
+    {
       Ok(()) => Ok(()),
       Err(CoreErrorKind::Js(err)) => {
         // If the failure was caused by user code calling `Deno.exit()` at
@@ -859,19 +861,27 @@ async fn configure_main_worker(
       Err(err) => Err(err.into_box()),
     };
 
-  check_res(worker.execute_preload_modules().await)?;
-  if op_state.borrow().has::<ops::testing::IsolateExitInfo>() {
-    worker.cancel_terminate_execution();
-    return Ok((coverage_collector, worker.into_main_worker()));
-  }
-  check_res(worker.execute_side_module().await)?;
-  if op_state.borrow().has::<ops::testing::IsolateExitInfo>() {
-    worker.cancel_terminate_execution();
-  }
+    check_res(worker.execute_preload_modules().await)?;
+    if op_state.borrow().has::<ops::testing::IsolateExitInfo>() {
+      worker.cancel_terminate_execution();
+      return Ok(coverage_collector);
+    }
+    check_res(worker.execute_side_module().await)?;
+    if op_state.borrow().has::<ops::testing::IsolateExitInfo>() {
+      worker.cancel_terminate_execution();
+    }
 
-  let worker = worker.into_main_worker();
-
-  Ok((coverage_collector, worker))
+    Ok(coverage_collector)
+  }
+  .await;
+  let mut worker = worker.into_main_worker();
+  match result {
+    Ok(coverage_collector) => Ok((coverage_collector, worker)),
+    Err(error) => {
+      worker.shutdown_napi().await;
+      Err(error)
+    }
+  }
 }
 
 /// Test a single specifier as documentation containing test programs, an executable test module or
@@ -904,28 +914,25 @@ pub async fn test_specifier(
   .await?;
   let event_tracker = TestEventTracker::new(worker.js_runtime.op_state());
 
-  // If user code already called `Deno.exit()` during top-level evaluation in
-  // `configure_main_worker`, the isolate-exit event has already been sent.
-  // Skip the rest of the lifecycle - the isolate is terminated and there are
-  // no tests to run.
-  if worker
+  let result = if worker
     .js_runtime
     .op_state()
     .borrow()
     .has::<ops::testing::IsolateExitInfo>()
   {
-    return Ok(());
-  }
-
-  let result = test_specifier_inner(
-    &mut worker,
-    coverage_collector,
-    specifier.clone(),
-    fail_fast_tracker,
-    &event_tracker,
-    options,
-  )
-  .await;
+    drop(coverage_collector);
+    Ok(())
+  } else {
+    test_specifier_inner(
+      &mut worker,
+      coverage_collector,
+      specifier.clone(),
+      fail_fast_tracker,
+      &event_tracker,
+      options,
+    )
+    .await
+  };
 
   // If user code called `Deno.exit()` from inside `dispatch_load_event`,
   // `run_tests_for_worker`, or `dispatch_unload_event`, the V8 isolate was
@@ -942,6 +949,15 @@ pub async fn test_specifier(
     // Clear V8's "terminating" flag so the worker can be cleanly dropped.
     worker.js_runtime.v8_isolate().cancel_terminate_execution();
   }
+
+  worker.shutdown_napi().await;
+  // Flush output emitted by native cleanup before dropping the test sender.
+  _ = worker
+    .js_runtime
+    .op_state()
+    .borrow_mut()
+    .borrow_mut::<TestEventSender>()
+    .flush();
 
   match result {
     Ok(()) => Ok(()),
@@ -1018,15 +1034,6 @@ async fn test_specifier_inner(
   // behavior; otherwise the connection is dropped mid-flight, making it
   // impossible to profile `deno test` runs. See issue #19289.
   worker.wait_for_inspector_session_disconnect().await?;
-
-  worker.shutdown_napi().await;
-  // Flush output emitted by native cleanup before dropping the test sender.
-  _ = worker
-    .js_runtime
-    .op_state()
-    .borrow_mut()
-    .borrow_mut::<TestEventSender>()
-    .flush();
 
   Ok(())
 }

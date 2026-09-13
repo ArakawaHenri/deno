@@ -37,6 +37,7 @@ use log::debug;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::oneshot;
 
 use crate::ops::TestingFeaturesEnabled;
 use crate::tokio_util::create_and_run_current_thread;
@@ -117,11 +118,15 @@ pub struct WorkerThread {
   ctrl_closed: bool,
   message_closed: bool,
   termination_requested: bool,
+  completion: Option<(oneshot::Receiver<()>, std::thread::JoinHandle<()>)>,
 }
 
 impl WorkerThread {
   fn request_termination(&mut self) {
     self.termination_requested = true;
+    if matches!(self.worker_type, WorkerThreadType::Node) {
+      self.worker_handle.terminate_execution();
+    }
     self.worker_handle.clone().terminate();
   }
 
@@ -385,8 +390,10 @@ fn op_create_worker(
   let cpu_thread_handle = Arc::new(AtomicU64::new(0));
   let cpu_thread_handle_writer = cpu_thread_handle.clone();
 
+  let (completion_tx, completion_rx) = oneshot::channel();
+
   // Spawn it
-  thread_builder.spawn(move || {
+  let thread = thread_builder.spawn(move || {
     // Capture the OS thread handle for CPU usage queries from the host.
     cpu_thread_handle_writer
       .store(capture_current_thread_handle(), Ordering::Release);
@@ -443,6 +450,8 @@ fn op_create_worker(
         libc::malloc_trim(0);
       }
     }
+    // Native cleanup and runtime destruction must precede the host's exit event.
+    let _ = completion_tx.send(());
   })?;
 
   // Receive WebWorkerHandle from newly created worker
@@ -467,6 +476,7 @@ fn op_create_worker(
     ctrl_closed: false,
     message_closed: false,
     termination_requested: false,
+    completion: Some((completion_rx, thread)),
   };
 
   // At this point all interactions with worker happen using thread
@@ -482,11 +492,7 @@ fn op_create_worker(
 fn op_host_terminate_worker(state: &mut OpState, #[scoped] id: WorkerId) {
   match state.borrow_mut::<WorkersTable>().entry(id) {
     std::collections::hash_map::Entry::Occupied(mut entry) => {
-      if matches!(entry.get().worker_type, WorkerThreadType::Node) {
-        entry.remove().finish_termination();
-      } else {
-        entry.get_mut().request_termination();
-      }
+      entry.get_mut().request_termination();
     }
     std::collections::hash_map::Entry::Vacant(_) => {
       debug!("tried to terminate non-existent worker {}", id);
@@ -541,12 +547,16 @@ async fn op_host_recv_ctrl(
   state: Rc<RefCell<OpState>>,
   #[scoped] id: WorkerId,
 ) -> WorkerControlEvent {
-  let (worker_handle, cancel_handle) = {
-    let state = state.borrow();
-    let workers_table = state.borrow::<WorkersTable>();
-    let maybe_handle = workers_table.get(&id);
+  let (worker_handle, cancel_handle, completion) = {
+    let mut state = state.borrow_mut();
+    let workers_table = state.borrow_mut::<WorkersTable>();
+    let maybe_handle = workers_table.get_mut(&id);
     if let Some(handle) = maybe_handle {
-      (handle.worker_handle.clone(), handle.cancel_handle.clone())
+      (
+        handle.worker_handle.clone(),
+        handle.cancel_handle.clone(),
+        handle.completion.take(),
+      )
     } else {
       // If handle was not found it means worker has already shutdown
       return WorkerControlEvent::Close(0);
@@ -557,6 +567,11 @@ async fn op_host_recv_ctrl(
     .get_control_event()
     .or_cancel(cancel_handle)
     .await;
+  if let Some((completion, thread)) = completion {
+    let _ = completion.await;
+    // Joining also waits for thread-local destructors without blocking the host.
+    let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+  }
   match maybe_event {
     Ok(Some(event)) => {
       // Terminal error or close means that worker should be removed from worker table.

@@ -473,6 +473,7 @@ struct WorkerShutdown {
   loop_: *mut libuv_sys_lite::uv_loop_t,
   work: libuv_sys_lite::uv_work_t,
   timer: libuv_sys_lite::uv_timer_t,
+  closing_timer: libuv_sys_lite::uv_timer_t,
   handle: napi_async_cleanup_hook_handle,
 }
 
@@ -487,6 +488,19 @@ unsafe extern "C" fn shutdown_work(_work: *mut libuv_sys_lite::uv_work_t) {
 }
 
 unsafe extern "C" fn shutdown_timer_closed(
+  handle: *mut libuv_sys_lite::uv_handle_t,
+) {
+  let state = unsafe { &mut *(*handle).data.cast::<WorkerShutdown>() };
+  // A close callback can queue another close for the next native loop turn.
+  unsafe {
+    libuv_sys_lite::uv_close(
+      (&raw mut state.closing_timer).cast(),
+      Some(shutdown_complete),
+    );
+  }
+}
+
+unsafe extern "C" fn shutdown_complete(
   handle: *mut libuv_sys_lite::uv_handle_t,
 ) {
   let cleanup = {
@@ -596,8 +610,21 @@ extern "C" fn test_worker_shutdown(
     loop_: loop_.cast(),
     work: unsafe { std::mem::zeroed() },
     timer: unsafe { std::mem::zeroed() },
+    closing_timer: unsafe { std::mem::zeroed() },
     handle: ptr::null_mut(),
   }));
+  assert_eq!(
+    unsafe {
+      libuv_sys_lite::uv_timer_init(
+        loop_.cast(),
+        &raw mut (*state).closing_timer,
+      )
+    },
+    0
+  );
+  unsafe {
+    (*state).closing_timer.data = state.cast();
+  }
   assert_napi_ok!(napi_add_async_cleanup_hook(
     env,
     Some(shutdown_async),

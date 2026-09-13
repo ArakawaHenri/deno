@@ -4,9 +4,11 @@ import { parentPort, workerData } from "node:worker_threads";
 import { loadTestLibrary } from "./common.js";
 
 const lib = loadTestLibrary();
+const version10 = loadTestLibrary("examples/napi_version_10");
 globalThis.retainedFinalizers = [
   lib.test_worker_finalizers(),
   lib.test_worker_shutdown(() => 1),
+  version10.create(() => 1),
 ];
 parentPort.postMessage("ready");
 if (workerData.mode === "error") {
@@ -15,4 +17,8 @@ if (workerData.mode === "error") {
   }, 0);
 } else if (workerData.mode === "terminate") {
   setInterval(() => {}, 1000);
+} else if (workerData.mode === "busy") {
+  while (true) {
+    // Keep the isolate in JavaScript until the host terminates it.
+  }
 }

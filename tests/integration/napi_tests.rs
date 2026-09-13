@@ -18,8 +18,12 @@ const BUILD_VARIANT: &str = "release";
 
 fn napi_build() {
   let mut build_plugin_base = Command::new("cargo");
-  let mut build_plugin =
-    build_plugin_base.arg("build").arg("-p").arg("test_napi");
+  let mut build_plugin = build_plugin_base
+    .arg("build")
+    .arg("-p")
+    .arg("test_napi")
+    .arg("--examples")
+    .arg("--lib");
   if BUILD_VARIANT == "release" {
     build_plugin = build_plugin.arg("--release");
   }

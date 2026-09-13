@@ -136,6 +136,7 @@ pub mod Status {
   pub const napi_arraybuffer_expected: i32 = 19;
   pub const napi_detachable_arraybuffer_expected: i32 = 20;
   pub const napi_would_deadlock: i32 = 21;
+  pub const napi_cannot_run_js: i32 = 23;
 }
 
 pub type napi_callback = Option<

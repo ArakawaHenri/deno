@@ -3,6 +3,7 @@
 import { loadTestLibrary } from "./common.js";
 
 const lib = loadTestLibrary();
+const version10 = loadTestLibrary("examples/napi_version_10");
 
 // Signal that the addon is loaded
 self.postMessage("ready");
@@ -12,6 +13,7 @@ self.onmessage = (e) => {
     globalThis.retainedFinalizers = [
       lib.test_worker_finalizers(),
       lib.test_worker_shutdown(() => 1),
+      version10.create(() => 1),
     ];
     self.postMessage("created");
   } else if (e.data === "error") {

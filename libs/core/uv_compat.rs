@@ -307,10 +307,7 @@ impl UvLoopInner {
     self.shared.loop_waker.register(waker);
   }
 
-  /// Wake the event loop so it re-polls on the next tick. Used on
-  /// Windows to ensure pending TTY write callbacks are processed
-  /// promptly when there is no async I/O notification mechanism.
-  #[cfg(windows)]
+  /// Wake the event loop when callbacks become ready without an I/O event.
   pub(crate) fn wake(&self) {
     if let Some(waker) = self.waker.borrow().as_ref() {
       waker.wake_by_ref();
@@ -1501,6 +1498,7 @@ pub unsafe extern "C" fn uv_close(
       .closing_handles
       .borrow_mut()
       .push_back((handle, close_cb));
+    inner.wake();
   }
 }
 
