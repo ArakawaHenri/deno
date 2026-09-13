@@ -457,8 +457,192 @@ extern "C" fn test_worker_finalizer_count(
   result
 }
 
+static WORKER_SHUTDOWNS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, PartialEq)]
+enum ShutdownPhase {
+  Registered,
+  SyncCleanup,
+  AsyncCleanup,
+  Complete,
+}
+
+struct WorkerShutdown {
+  phase: ShutdownPhase,
+  callback: napi_ref,
+  loop_: *mut libuv_sys_lite::uv_loop_t,
+  work: libuv_sys_lite::uv_work_t,
+  timer: libuv_sys_lite::uv_timer_t,
+  handle: napi_async_cleanup_hook_handle,
+}
+
+unsafe extern "C" fn shutdown_sync(data: *mut std::ffi::c_void) {
+  let state = unsafe { &mut *data.cast::<WorkerShutdown>() };
+  assert_eq!(state.phase, ShutdownPhase::Registered);
+  state.phase = ShutdownPhase::SyncCleanup;
+}
+
+unsafe extern "C" fn shutdown_work(_work: *mut libuv_sys_lite::uv_work_t) {
+  std::thread::sleep(std::time::Duration::from_millis(10));
+}
+
+unsafe extern "C" fn shutdown_timer_closed(
+  handle: *mut libuv_sys_lite::uv_handle_t,
+) {
+  let cleanup = {
+    let state = unsafe { &mut *(*handle).data.cast::<WorkerShutdown>() };
+    assert_eq!(state.phase, ShutdownPhase::AsyncCleanup);
+    state.phase = ShutdownPhase::Complete;
+    state.handle
+  };
+  assert_napi_ok!(napi_remove_async_cleanup_hook(cleanup));
+}
+
+unsafe extern "C" fn shutdown_timer(timer: *mut libuv_sys_lite::uv_timer_t) {
+  unsafe {
+    libuv_sys_lite::uv_close(timer.cast(), Some(shutdown_timer_closed));
+  }
+}
+
+unsafe extern "C" fn shutdown_work_done(
+  work: *mut libuv_sys_lite::uv_work_t,
+  status: i32,
+) {
+  assert_eq!(status, 0);
+  let (loop_, timer, data) = {
+    let data = unsafe { (*work).data };
+    let state = unsafe { &mut *data.cast::<WorkerShutdown>() };
+    (state.loop_, &raw mut state.timer, data)
+  };
+  // Cleanup must cross the task, timer and close queues before finalization.
+  assert_eq!(unsafe { libuv_sys_lite::uv_timer_init(loop_, timer) }, 0);
+  unsafe {
+    (*timer).data = data;
+  }
+  assert_eq!(
+    unsafe {
+      libuv_sys_lite::uv_timer_start(timer, Some(shutdown_timer), 5, 0)
+    },
+    0
+  );
+}
+
+unsafe extern "C" fn shutdown_async(
+  handle: napi_async_cleanup_hook_handle,
+  data: *mut std::ffi::c_void,
+) {
+  let (loop_, work) = {
+    let state = unsafe { &mut *data.cast::<WorkerShutdown>() };
+    assert_eq!(state.phase, ShutdownPhase::SyncCleanup);
+    state.phase = ShutdownPhase::AsyncCleanup;
+    state.handle = handle;
+    state.work.data = data;
+    (state.loop_, &raw mut state.work)
+  };
+  assert_eq!(
+    unsafe {
+      libuv_sys_lite::uv_queue_work(
+        loop_,
+        work,
+        Some(shutdown_work),
+        Some(shutdown_work_done),
+      )
+    },
+    0
+  );
+}
+
+unsafe extern "C" fn shutdown_finalize(
+  env: napi_env,
+  data: *mut std::ffi::c_void,
+  _hint: *mut std::ffi::c_void,
+) {
+  let state = unsafe { Box::from_raw(data.cast::<WorkerShutdown>()) };
+  assert_eq!(state.phase, ShutdownPhase::Complete);
+  let mut callback = ptr::null_mut();
+  let mut receiver = ptr::null_mut();
+  assert_napi_ok!(napi_get_reference_value(env, state.callback, &mut callback));
+  assert_napi_ok!(napi_get_undefined(env, &mut receiver));
+  assert_eq!(
+    unsafe {
+      napi_call_function(
+        env,
+        receiver,
+        callback,
+        0,
+        ptr::null(),
+        ptr::null_mut(),
+      )
+    },
+    napi_sys::Status::napi_pending_exception
+  );
+  assert_napi_ok!(napi_delete_reference(env, state.callback));
+  WORKER_SHUTDOWNS.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn test_worker_shutdown(
+  env: napi_env,
+  info: napi_callback_info,
+) -> napi_value {
+  let (args, argc, _) = napi_get_callback_info!(env, info, 1);
+  assert_eq!(argc, 1);
+  let mut callback = ptr::null_mut();
+  let mut loop_ = ptr::null_mut();
+  assert_napi_ok!(napi_create_reference(env, args[0], 1, &mut callback));
+  assert_napi_ok!(napi_get_uv_event_loop(env, &mut loop_));
+  let state = Box::into_raw(Box::new(WorkerShutdown {
+    phase: ShutdownPhase::Registered,
+    callback,
+    loop_: loop_.cast(),
+    work: unsafe { std::mem::zeroed() },
+    timer: unsafe { std::mem::zeroed() },
+    handle: ptr::null_mut(),
+  }));
+  assert_napi_ok!(napi_add_async_cleanup_hook(
+    env,
+    Some(shutdown_async),
+    state.cast(),
+    ptr::null_mut()
+  ));
+  assert_napi_ok!(napi_add_env_cleanup_hook(
+    env,
+    Some(shutdown_sync),
+    state.cast()
+  ));
+  let mut result = ptr::null_mut();
+  assert_napi_ok!(napi_create_object(env, &mut result));
+  assert_napi_ok!(napi_wrap(
+    env,
+    result,
+    state.cast(),
+    Some(shutdown_finalize),
+    ptr::null_mut(),
+    ptr::null_mut()
+  ));
+  result
+}
+
+extern "C" fn test_worker_shutdown_count(
+  env: napi_env,
+  _info: napi_callback_info,
+) -> napi_value {
+  let mut result = ptr::null_mut();
+  assert_napi_ok!(napi_create_uint32(
+    env,
+    WORKER_SHUTDOWNS.load(Ordering::SeqCst),
+    &mut result
+  ));
+  result
+}
+
 pub fn init(env: napi_env, exports: napi_value) {
   let properties = &[
+    napi_new_property!(env, "test_worker_shutdown", test_worker_shutdown),
+    napi_new_property!(
+      env,
+      "test_worker_shutdown_count",
+      test_worker_shutdown_count
+    ),
     napi_new_property!(env, "test_worker_finalizers", test_worker_finalizers),
     napi_new_property!(
       env,

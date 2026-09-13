@@ -85,13 +85,23 @@ struct AsyncCleanupHandle {
   env: *mut Env,
   hook: napi_async_cleanup_hook,
   data: *mut c_void,
+  started: AtomicBool,
+  pending: Arc<AsyncCleanupTasks>,
 }
 
 unsafe extern "C" fn async_cleanup_handler(arg: *mut c_void) {
-  unsafe {
-    let handle = Box::<AsyncCleanupHandle>::from_raw(arg as _);
-    (handle.hook)(arg, handle.data);
-  }
+  let raw = arg.cast::<AsyncCleanupHandle>();
+  // Keep the handle alive until its callback returns, even if the callback
+  // removes its registration synchronously and immediately registers another.
+  // SAFETY: the registered hook owns the raw Arc until invocation or removal.
+  let handle = unsafe {
+    Arc::increment_strong_count(raw);
+    Arc::from_raw(raw)
+  };
+  handle.started.store(true, Ordering::Release);
+  handle.pending.start();
+  // SAFETY: hook and data were supplied together by the addon.
+  unsafe { (handle.hook)(arg, handle.data) };
 }
 
 #[napi_sym]
@@ -106,10 +116,19 @@ fn napi_add_async_cleanup_hook(
 
   let hook = hook.unwrap();
 
-  let handle = Box::into_raw(Box::new(AsyncCleanupHandle {
+  let Some(pending) = env.async_cleanup.clone() else {
+    return napi_set_last_error(env, napi_closing);
+  };
+  #[allow(
+    clippy::arc_with_non_send_sync,
+    reason = "native completion shares a raw handle; only unstarted removal accesses Env"
+  )]
+  let handle = Arc::into_raw(Arc::new(AsyncCleanupHandle {
     env,
     hook,
     data: arg,
+    started: AtomicBool::new(false),
+    pending,
   })) as *mut c_void;
 
   env.add_cleanup_hook(async_cleanup_handler, handle);
@@ -131,12 +150,17 @@ fn napi_remove_async_cleanup_hook(
     return napi_invalid_arg;
   }
 
+  // SAFETY: the caller completes or cancels its registration exactly once.
   let handle =
-    unsafe { Box::<AsyncCleanupHandle>::from_raw(remove_handle as _) };
+    unsafe { Arc::<AsyncCleanupHandle>::from_raw(remove_handle as _) };
 
-  let env = unsafe { &mut *handle.env };
-
-  env.remove_cleanup_hook(async_cleanup_handler, remove_handle);
+  if handle.started.load(Ordering::Acquire) {
+    handle.pending.complete();
+  } else {
+    // SAFETY: an unstarted hook is removed on its live environment's thread.
+    let env = unsafe { &mut *handle.env };
+    env.remove_cleanup_hook(async_cleanup_handler, remove_handle);
+  }
 
   napi_ok
 }
@@ -1098,17 +1122,23 @@ impl TsFn {
 
     self.sender.spawn(move |scope: &mut v8::PinScope<'_, '_>| {
       let data = data.take();
+      let env = env.take();
+      // SAFETY: queued callbacks run on the environment's thread before it is dropped.
+      let closing = unsafe { (*env).closing };
+      let callback_env = if closing {
+        std::ptr::null_mut()
+      } else {
+        env as napi_env
+      };
 
-      // If is_closed then the TsFn struct has been freed. Don't read from
-      // the tsfn pointer. We still pass the real env (not null) because:
-      // 1. The env is valid (leaked via Box::into_raw, never freed)
-      // 2. V8 is alive (we're running on the V8 thread with a scope)
-      // 3. Many native addons (e.g. node-pty) dereference env without a
-      //    null check, causing SIGSEGV if we pass null
+      // After environment shutdown, Node-API delivers queued data with a null
+      // env and callback so addons can release it without accessing JavaScript.
+      // A closed TSFN can also have queued calls while its environment is live;
+      // that case retains the live env without dereferencing the freed TSFN.
       if is_closed.load(Ordering::Relaxed) {
         unsafe {
           call_js_cb(
-            env.take() as _,
+            callback_env,
             None::<v8::Local<v8::Value>>.into(),
             context.take() as _,
             data as _,
@@ -1128,15 +1158,14 @@ impl TsFn {
           }
         }
 
-        let func = tsfn.func.as_ref().map(|f| v8::Local::new(scope, f));
+        let func = if closing {
+          None
+        } else {
+          tsfn.func.as_ref().map(|f| v8::Local::new(scope, f))
+        };
 
         unsafe {
-          (tsfn.call_js_cb)(
-            tsfn.env as _,
-            func.into(),
-            tsfn.context,
-            data as _,
-          );
+          (tsfn.call_js_cb)(callback_env, func.into(), tsfn.context, data as _);
         }
       }
     });

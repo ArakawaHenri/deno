@@ -9,8 +9,13 @@ self.postMessage("ready");
 
 self.onmessage = (e) => {
   if (e.data === "create_finalizers") {
-    globalThis.retainedFinalizers = lib.test_worker_finalizers();
+    globalThis.retainedFinalizers = [
+      lib.test_worker_finalizers(),
+      lib.test_worker_shutdown(() => 1),
+    ];
     self.postMessage("created");
+  } else if (e.data === "error") {
+    throw new Error("worker shutdown error");
   } else if (e.data === "close") {
     self.close();
   }

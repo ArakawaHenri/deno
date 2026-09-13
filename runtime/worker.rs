@@ -1124,6 +1124,11 @@ impl MainWorker {
     deno_napi::run_ref_finalizers(&mut self.js_runtime);
   }
 
+  /// Finishes native addon cleanup before this worker's runtime is dropped.
+  pub async fn shutdown_napi(&mut self) {
+    deno_napi::shutdown(&mut self.js_runtime).await;
+  }
+
   /// Dispatches "beforeunload" event to the JavaScript runtime. Returns a boolean
   /// indicating if the event was prevented and thus event loop should continue
   /// running.

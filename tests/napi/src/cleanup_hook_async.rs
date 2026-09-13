@@ -10,11 +10,12 @@ use crate::napi_new_property;
 
 /// Async cleanup hook callback. Called during environment teardown.
 unsafe extern "C" fn async_cleanup_cb(
-  _handle: napi_async_cleanup_hook_handle,
+  handle: napi_async_cleanup_hook_handle,
   data: *mut c_void,
 ) {
   let value = data as i64;
   println!("async_cleanup({})", value);
+  assert_napi_ok!(napi_remove_async_cleanup_hook(handle));
 }
 
 /// Install two async cleanup hooks. The test verifies both are

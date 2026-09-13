@@ -1946,6 +1946,45 @@ impl JsRuntime {
     self.inner.main_realm.0.context_state.uv_loop_ptr.get()
   }
 
+  /// Polls native callbacks during resource cleanup without running JavaScript.
+  /// The caller decides when its native cleanup work has completed.
+  pub fn poll_native_tasks(&mut self, cx: &mut Context) {
+    self.inner.state.waker.register(cx.waker());
+    let context_state = self.inner.main_realm.0.context_state.clone();
+    scope!(scope, self);
+    v8::tc_scope!(scope, scope);
+    v8::disallow_javascript_execution_scope!(
+      scope,
+      scope,
+      v8::OnFailure::ThrowOnFailure
+    );
+
+    if let Some(inner) = context_state.uv_loop_inner.get() {
+      // SAFETY: the registered loop and its handles outlive this runtime tick.
+      unsafe {
+        (*inner).update_time();
+        (*inner).run_timers();
+      }
+    }
+    Self::dispatch_task_spawner(cx, scope, &context_state, false);
+    if let Some(inner) = context_state.uv_loop_inner.get() {
+      // SAFETY: the loop owns these callbacks until cleanup removes the handles.
+      let did_io = unsafe {
+        (*inner).run_idle();
+        (*inner).run_prepare();
+        (*inner).set_waker(cx.waker());
+        let did_io = (*inner).run_io();
+        (*inner).run_check();
+        (*inner).run_close();
+        did_io
+      };
+      if did_io {
+        cx.waker().wake_by_ref();
+      }
+    }
+    Self::arm_uv_timer_wakeup(cx, &context_state);
+  }
+
   /// Returns the runtime's source mapper, which can be used to apply
   /// source maps to file locations.
   pub fn source_mapper(&self) -> Rc<RefCell<crate::source_map::SourceMapper>> {
@@ -2476,7 +2515,8 @@ impl JsRuntime {
     modules.poll_progress(cx, scope)?;
 
     // 2a. V8 task spawner tasks
-    dispatched_ops |= Self::dispatch_task_spawner(cx, scope, context_state);
+    dispatched_ops |=
+      Self::dispatch_task_spawner(cx, scope, context_state, true);
 
     // 2b. Process expired JS timers first and immediately commit the
     // returned next-expiry state. Completed ops are resolved afterwards so
@@ -2650,36 +2690,7 @@ impl JsRuntime {
       return Poll::Ready(Ok(()));
     }
 
-    // Arm a wakeup for the next pending libuv (N-API) timer deadline. The uv
-    // timer phase (Phase 1) fires expired timers at the top of each tick, but
-    // nothing else re-polls the event loop *at* a timer's deadline. A native
-    // `uv_timer_t` that is the only pending work would therefore never fire
-    // until some unrelated event happened to wake the loop. Mirror libuv's
-    // `uv__next_timeout`: schedule a sleep for the earliest deadline and let it
-    // re-poll us. Only re-arm when the earliest deadline changes to avoid
-    // recreating the timer on every tick. See #36454.
-    if let Some(uv_inner_ptr) = context_state.uv_loop_inner.get() {
-      match unsafe { (*uv_inner_ptr).next_timeout() } {
-        Some((deadline, delay)) => {
-          if context_state.uv_timer_wake_deadline.get() != Some(deadline) {
-            context_state.uv_timer_wake.schedule(delay);
-            context_state.uv_timer_wake_deadline.set(Some(deadline));
-          }
-          // Keep this task's waker registered with the sleep. If the deadline
-          // has already elapsed, re-poll immediately so Phase 1 fires it on the
-          // next tick rather than waiting for another wakeup.
-          if context_state.uv_timer_wake.poll_ready(cx).is_ready() {
-            self.inner.state.waker.wake();
-          }
-        }
-        None => {
-          if context_state.uv_timer_wake_deadline.get().is_some() {
-            context_state.uv_timer_wake.clear();
-            context_state.uv_timer_wake_deadline.set(None);
-          }
-        }
-      }
-    }
+    Self::arm_uv_timer_wakeup(cx, context_state);
 
     // Re-wake logic for next iteration
     #[allow(
@@ -3497,11 +3508,38 @@ impl JsRuntime {
     Ok(true)
   }
 
+  /// Keeps the next native timer deadline registered with the polling task.
+  fn arm_uv_timer_wakeup(cx: &mut Context, context_state: &ContextState) {
+    if let Some(uv_inner_ptr) = context_state.uv_loop_inner.get() {
+      match unsafe { (*uv_inner_ptr).next_timeout() } {
+        Some((deadline, delay)) => {
+          if context_state.uv_timer_wake_deadline.get() != Some(deadline) {
+            context_state.uv_timer_wake.schedule(delay);
+            context_state.uv_timer_wake_deadline.set(Some(deadline));
+          }
+          // Keep this task's waker registered with the sleep. If the deadline
+          // has already elapsed, re-poll immediately so Phase 1 fires it on the
+          // next tick rather than waiting for another wakeup.
+          if context_state.uv_timer_wake.poll_ready(cx).is_ready() {
+            cx.waker().wake_by_ref();
+          }
+        }
+        None => {
+          if context_state.uv_timer_wake_deadline.get().is_some() {
+            context_state.uv_timer_wake.clear();
+            context_state.uv_timer_wake_deadline.set(None);
+          }
+        }
+      }
+    }
+  }
+
   /// Phase 2a: Poll and dispatch V8 task spawner tasks.
   fn dispatch_task_spawner(
     cx: &mut Context,
     scope: &mut v8::PinScope,
     context_state: &ContextState,
+    run_microtasks: bool,
   ) -> bool {
     let mut dispatched = false;
     let mut retries = 3;
@@ -3512,7 +3550,7 @@ impl JsRuntime {
       for task in tasks {
         task(scope);
       }
-      if !context_state.has_tick_scheduled() {
+      if run_microtasks && !context_state.has_tick_scheduled() {
         scope.perform_microtask_checkpoint();
       }
 

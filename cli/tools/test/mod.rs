@@ -1002,20 +1002,6 @@ async fn test_specifier_inner(
     .dispatch_unload_event()
     .map_err(|e| CoreErrorKind::Js(e).into_box())?;
 
-  // Run any pending Node-API finalizers before the worker is torn down. This
-  // matches the `deno run`/`deno bench` paths and Node.js, where finalizers
-  // registered via `napi_wrap`/`napi_add_finalizer` are invoked at teardown
-  // even if the wrapped value was never garbage collected during the run.
-  worker.run_napi_ref_finalizers();
-
-  // Ensure all output has been flushed
-  _ = worker
-    .js_runtime
-    .op_state()
-    .borrow_mut()
-    .borrow_mut::<TestEventSender>()
-    .flush();
-
   // Ensure the worker has settled so we can catch any remaining unhandled rejections. We don't
   // want to wait forever here.
   worker.run_up_to_duration(Duration::from_millis(0)).await?;
@@ -1032,6 +1018,15 @@ async fn test_specifier_inner(
   // behavior; otherwise the connection is dropped mid-flight, making it
   // impossible to profile `deno test` runs. See issue #19289.
   worker.wait_for_inspector_session_disconnect().await?;
+
+  worker.shutdown_napi().await;
+  // Flush output emitted by native cleanup before dropping the test sender.
+  _ = worker
+    .js_runtime
+    .op_state()
+    .borrow_mut()
+    .borrow_mut::<TestEventSender>()
+    .flush();
 
   Ok(())
 }

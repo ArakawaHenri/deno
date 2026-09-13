@@ -233,8 +233,8 @@ macro_rules! napi_wrap {
     $vis unsafe extern "C" fn $name $( < $( $x ),* > )? ( env_ptr : *mut Env , $( $ident : $ty ),* ) -> napi_status {
       let env: & $( $lt )? mut Env = $crate::check_env!(env_ptr);
 
-      if env.last_exception.is_some() {
-        return napi_pending_exception;
+      if env.last_exception.is_some() || env.closing {
+        return $crate::util::napi_set_last_error(env_ptr, napi_pending_exception);
       }
 
       $crate::util::napi_clear_last_error(env);

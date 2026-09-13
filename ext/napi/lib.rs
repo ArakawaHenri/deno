@@ -60,6 +60,8 @@ use libloading::os::unix::*;
 use libloading::os::windows::*;
 pub use value::napi_value;
 
+use crate::util::SendPtr;
+
 pub mod function;
 // Only used to diagnose Windows addons that link against `node.exe`; on unix the
 // helpers are exercised solely by their unit tests.
@@ -464,10 +466,33 @@ impl RefTracker {
   }
 }
 
+#[derive(Default)]
+pub(crate) struct AsyncCleanupTasks {
+  count: std::sync::atomic::AtomicUsize,
+  waker: deno_core::futures::task::AtomicWaker,
+}
+
+impl AsyncCleanupTasks {
+  fn start(&self) {
+    self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+  }
+
+  fn complete(&self) {
+    self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    self.waker.wake();
+  }
+
+  fn is_empty(&self) -> bool {
+    self.count.load(std::sync::atomic::Ordering::Acquire) == 0
+  }
+}
+
 pub struct NapiState {
   // Thread safe functions.
   pub env_cleanup_hooks: Rc<RefCell<Vec<(napi_cleanup_hook, *mut c_void)>>>,
   pub ref_tracker: Rc<RefCell<RefTracker>>,
+  closing: Cell<bool>,
+  async_cleanup: std::sync::Arc<AsyncCleanupTasks>,
   pub env_shared_ptrs: Vec<*mut EnvShared>,
   /// Raw Env pointers for teardown of external string finalizers.
   pub env_ptrs: Vec<*mut Env>,
@@ -479,9 +504,85 @@ pub struct NapiState {
   pub type_tag: Option<v8::Global<v8::Private>>,
 }
 
+impl NapiState {
+  fn begin_shutdown(&self) {
+    self.closing.set(true);
+    for env in &self.env_ptrs {
+      // SAFETY: these environments belong to this isolate and outlive its shutdown.
+      unsafe {
+        (**env).closing = true;
+      }
+    }
+  }
+}
+
 // SAFETY: finalizer pointers in env_shared_ptrs are only accessed during Drop
 // on the same thread that created them.
 unsafe impl Send for NapiState {}
+
+fn run_cleanup_hooks(hooks: &RefCell<Vec<(napi_cleanup_hook, *mut c_void)>>) {
+  while !hooks.borrow().is_empty() {
+    let batch = hooks.borrow().clone();
+    for (hook, data) in batch.into_iter().rev() {
+      if !hooks
+        .borrow()
+        .iter()
+        .any(|entry| std::ptr::fn_addr_eq(entry.0, hook) && entry.1 == data)
+      {
+        continue;
+      }
+      // SAFETY: registrations remain owned by the addon until called or removed.
+      // No borrow is held while the hook can remove itself or other hooks.
+      unsafe { hook(data) };
+      hooks.borrow_mut().retain(|entry| {
+        !(std::ptr::fn_addr_eq(entry.0, hook) && entry.1 == data)
+      });
+    }
+  }
+}
+
+/// Completes addon cleanup before invoking reference finalizers.
+/// JavaScript stays disabled while native callbacks finish asynchronous cleanup.
+pub async fn shutdown(js_runtime: &mut deno_core::JsRuntime) {
+  let (hooks, pending) = {
+    let state = js_runtime.op_state();
+    let state = state.borrow();
+    let Some(napi) = state.try_borrow::<NapiState>() else {
+      return;
+    };
+    napi.begin_shutdown();
+    (napi.env_cleanup_hooks.clone(), napi.async_cleanup.clone())
+  };
+  loop {
+    {
+      deno_core::scope!(scope, js_runtime);
+      v8::disallow_javascript_execution_scope!(
+        _no_js,
+        scope,
+        v8::OnFailure::ThrowOnFailure
+      );
+      run_cleanup_hooks(&hooks);
+    }
+    deno_core::futures::future::poll_fn(|cx| {
+      if pending.is_empty() {
+        return std::task::Poll::Ready(());
+      }
+      pending.waker.register(cx.waker());
+      js_runtime.poll_native_tasks(cx);
+      if pending.is_empty() {
+        pending.waker.take();
+        std::task::Poll::Ready(())
+      } else {
+        std::task::Poll::Pending
+      }
+    })
+    .await;
+    if hooks.borrow().is_empty() {
+      break;
+    }
+  }
+  run_ref_finalizers(js_runtime);
+}
 
 /// Runs pending ref/wrap finalizers while the runtime's V8 isolate is alive.
 /// Taking registrations before invoking callbacks preserves the run-once contract.
@@ -490,7 +591,10 @@ pub fn run_ref_finalizers(js_runtime: &mut deno_core::JsRuntime) {
     let op_state = js_runtime.op_state();
     let op_state = op_state.borrow();
     match op_state.try_borrow::<NapiState>() {
-      Some(s) => s.ref_tracker.borrow_mut().take_pending(),
+      Some(s) => {
+        s.begin_shutdown();
+        s.ref_tracker.borrow_mut().take_pending()
+      }
       None => return,
     }
   };
@@ -503,7 +607,11 @@ pub fn run_ref_finalizers(js_runtime: &mut deno_core::JsRuntime) {
   // Node.js's linked list behavior (head insertion → reverse iteration).
   {
     deno_core::scope!(scope, js_runtime);
-    let _scope = v8::HandleScope::new(scope);
+    v8::disallow_javascript_execution_scope!(
+      _no_js,
+      scope,
+      v8::OnFailure::ThrowOnFailure
+    );
     for f in finalizers.into_iter().rev() {
       // SAFETY: The pointers (env, data, hint) were stored when the native
       // addon called napi_wrap/napi_create_external/napi_add_finalizer and
@@ -524,42 +632,21 @@ impl Drop for NapiState {
     // disposal reclaims by firing the V8 destructor with a null Env. They
     // cannot be swept here because V8 still reads their buffers.
     for env_ptr in &self.env_ptrs {
+      // Env pointers remain available to late native calls; their cleanup
+      // state must not keep a finished runtime's tasks alive.
+      // SAFETY: env_ptrs contains the live allocations created by op_napi_open.
+      unsafe {
+        (**env_ptr).closing = true;
+        (**env_ptr).async_cleanup = None;
+      }
       crate::js_native_api::detach_external_string_env(*env_ptr);
     }
 
-    let hooks = {
-      let h = self.env_cleanup_hooks.borrow_mut();
-      h.clone()
-    };
-
-    // Hooks are supposed to be run in LIFO order
-    let hooks_to_run = hooks.into_iter().rev();
-
-    for hook in hooks_to_run {
-      // This hook might have been removed by a previous hook, in such case skip it here.
-      if !self
-        .env_cleanup_hooks
-        .borrow()
-        .iter()
-        .any(|pair| std::ptr::fn_addr_eq(pair.0, hook.0) && pair.1 == hook.1)
-      {
-        continue;
-      }
-
-      unsafe {
-        (hook.0)(hook.1);
-      }
-
-      {
-        self.env_cleanup_hooks.borrow_mut().retain(|pair| {
-          !(std::ptr::fn_addr_eq(pair.0, hook.0) && pair.1 == hook.1)
-        });
-      }
-    }
+    run_cleanup_hooks(&self.env_cleanup_hooks);
 
     // Note: remaining ref tracker entries are not finalized here because
-    // V8 is no longer alive. Workers call run_ref_finalizers before
-    // dropping their JsRuntime, while V8 can still service NAPI calls.
+    // V8 is no longer alive. Workers finish shutdown before dropping
+    // their JsRuntime, while native callbacks can still use NAPI handles.
 
     // Call instance data finalize callbacks for all registered EnvShared instances.
     // Each entry should be unique since each op_napi_open creates a fresh EnvShared.
@@ -641,6 +728,8 @@ pub struct Env {
   gc_finalizer_spawner: V8TaskSpawner,
   cleanup_hooks: Rc<RefCell<Vec<(napi_cleanup_hook, *mut c_void)>>>,
   ref_tracker: Rc<RefCell<RefTracker>>,
+  pub(crate) closing: bool,
+  async_cleanup: Option<std::sync::Arc<AsyncCleanupTasks>>,
   external_ops_tracker: ExternalOpsTracker,
   pub last_error: napi_extended_error_info,
   pub last_exception: Option<v8::Global<v8::Value>>,
@@ -659,7 +748,7 @@ unsafe impl Sync for Env {}
 
 impl Env {
   #[allow(clippy::too_many_arguments, reason = "construction")]
-  pub fn new(
+  fn new(
     isolate_ptr: v8::UnsafeRawIsolatePtr,
     context: v8::Global<v8::Context>,
     global: v8::Global<v8::Object>,
@@ -673,6 +762,8 @@ impl Env {
     gc_finalizer_spawner: V8TaskSpawner,
     cleanup_hooks: Rc<RefCell<Vec<(napi_cleanup_hook, *mut c_void)>>>,
     ref_tracker: Rc<RefCell<RefTracker>>,
+    closing: bool,
+    async_cleanup: std::sync::Arc<AsyncCleanupTasks>,
     external_ops_tracker: ExternalOpsTracker,
   ) -> Self {
     Self {
@@ -693,6 +784,8 @@ impl Env {
       gc_finalizer_spawner,
       cleanup_hooks,
       ref_tracker,
+      closing,
+      async_cleanup: Some(async_cleanup),
       external_ops_tracker,
       last_error: napi_extended_error_info {
         error_message: std::ptr::null(),
@@ -846,10 +939,14 @@ impl Env {
       });
     // Only the first finalizer of a GC batch schedules a drain; the rest ride
     // along on the same task (see `RefTracker::defer`).
-    if need_schedule {
+    if need_schedule && !env.closing {
       let tracker = env.ref_tracker.clone();
+      let env_ptr = SendPtr(env_ptr);
       env.gc_finalizer_spawner.spawn(move |scope| {
-        drain_gc_finalizers(scope, &tracker);
+        // SAFETY: this task runs on the environment's isolate thread.
+        if !unsafe { (*env_ptr.take()).closing } {
+          drain_gc_finalizers(scope, &tracker);
+        }
       });
     }
   }
@@ -924,6 +1021,8 @@ deno_core::extension!(deno_napi,
     state.put(NapiState {
       env_cleanup_hooks: Rc::new(RefCell::new(vec![])),
       ref_tracker: Rc::new(RefCell::new(RefTracker::default())),
+      closing: Cell::new(false),
+      async_cleanup: std::sync::Arc::default(),
       env_shared_ptrs: vec![],
       env_ptrs: vec![],
       napi_wrap: None,
@@ -966,6 +1065,8 @@ fn op_napi_open<'scope>(
     gc_finalizer_spawner,
     cleanup_hooks,
     ref_tracker,
+    closing,
+    async_cleanup,
     external_ops_tracker,
     deno_rt_native_addon_loader,
     path,
@@ -980,6 +1081,8 @@ fn op_napi_open<'scope>(
       op_state.borrow::<V8TaskSpawner>().clone(),
       napi_state.env_cleanup_hooks.clone(),
       napi_state.ref_tracker.clone(),
+      napi_state.closing.get(),
+      napi_state.async_cleanup.clone(),
       op_state.external_ops_tracker.clone(),
       op_state.try_borrow::<DenoRtNativeAddonLoaderRc>().cloned(),
       path,
@@ -1054,6 +1157,8 @@ fn op_napi_open<'scope>(
     gc_finalizer_spawner,
     cleanup_hooks,
     ref_tracker,
+    closing,
+    async_cleanup,
     external_ops_tracker,
   );
   env.shared = Box::into_raw(Box::new(env_shared));

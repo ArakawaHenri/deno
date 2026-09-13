@@ -457,8 +457,6 @@ pub struct WebWorker {
 
 impl Drop for WebWorker {
   fn drop(&mut self) {
-    deno_napi::run_ref_finalizers(&mut self.js_runtime);
-
     // clean up the package.json thread local cache
     node_resolver::PackageJsonThreadLocalCache::clear();
 
@@ -1138,6 +1136,23 @@ fn print_worker_error(
 // with terminate
 pub async fn run_web_worker(
   mut worker: WebWorker,
+  specifier: ModuleSpecifier,
+  maybe_source_code: Option<String>,
+  format_js_error_fn: Option<Arc<FormatJsErrorFn>>,
+) -> Result<(), CoreError> {
+  let result = run_web_worker_inner(
+    &mut worker,
+    specifier,
+    maybe_source_code,
+    format_js_error_fn,
+  )
+  .await;
+  deno_napi::shutdown(&mut worker.js_runtime).await;
+  result
+}
+
+async fn run_web_worker_inner(
+  worker: &mut WebWorker,
   specifier: ModuleSpecifier,
   mut maybe_source_code: Option<String>,
   format_js_error_fn: Option<Arc<FormatJsErrorFn>>,

@@ -272,7 +272,7 @@ impl CliMainWorker {
 
     self.worker.dispatch_unload_event()?;
     self.worker.dispatch_process_exit_event()?;
-    self.worker.run_napi_ref_finalizers();
+    self.worker.shutdown_napi().await;
 
     Ok(())
   }
@@ -339,7 +339,7 @@ impl CliMainWorker {
 
         self.inner.worker.dispatch_unload_event()?;
         self.inner.worker.dispatch_process_exit_event()?;
-        self.inner.worker.run_napi_ref_finalizers();
+        self.inner.worker.shutdown_napi().await;
 
         Ok(())
       }

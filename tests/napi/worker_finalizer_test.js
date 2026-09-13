@@ -2,19 +2,21 @@
 
 import { once } from "node:events";
 import { Worker as NodeWorker } from "node:worker_threads";
-import { assertEquals, loadTestLibrary } from "./common.js";
+import { assert, assertEquals, loadTestLibrary } from "./common.js";
 
 const lib = loadTestLibrary();
 
-async function assertFinalizerCount(expected) {
+async function assertShutdown(finalizers, shutdowns) {
   const deadline = performance.now() + 5000;
   while (
-    lib.test_worker_finalizer_count() < expected &&
+    (lib.test_worker_finalizer_count() < finalizers ||
+      lib.test_worker_shutdown_count() < shutdowns) &&
     performance.now() < deadline
   ) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assertEquals(lib.test_worker_finalizer_count(), expected);
+  assertEquals(lib.test_worker_finalizer_count(), finalizers);
+  assertEquals(lib.test_worker_shutdown_count(), shutdowns);
 }
 
 function messageFrom(worker) {
@@ -27,9 +29,10 @@ function messageFrom(worker) {
   });
 }
 
-for (const terminate of [false, true]) {
-  Deno.test(`napi finalizers run once when a Web Worker ${terminate ? "terminates" : "closes"}`, async () => {
-    let expected = lib.test_worker_finalizer_count();
+for (const mode of ["normal", "terminate", "error"]) {
+  Deno.test(`napi Web Worker shutdown (${mode})`, async () => {
+    let finalizers = lib.test_worker_finalizer_count();
+    let shutdowns = lib.test_worker_shutdown_count();
     for (let i = 0; i < 3; i++) {
       const worker = new Worker(
         new URL("./worker_termination_worker.js", import.meta.url),
@@ -40,30 +43,45 @@ for (const terminate of [false, true]) {
         const created = messageFrom(worker);
         worker.postMessage("create_finalizers");
         assertEquals(await created, "created");
-        if (terminate) worker.terminate();
-        else worker.postMessage("close");
-        expected += 3;
-        await assertFinalizerCount(expected);
+        if (mode === "terminate") worker.terminate();
+        else if (mode === "error") {
+          const failed = new Promise((resolve) => {
+            worker.onerror = (event) => {
+              event.preventDefault();
+              resolve(event.message);
+            };
+          });
+          worker.postMessage("error");
+          assert(String(await failed).includes("worker shutdown error"));
+        } else worker.postMessage("close");
+        finalizers += 3;
+        shutdowns++;
+        await assertShutdown(finalizers, shutdowns);
       } finally {
         worker.terminate();
       }
     }
   });
 
-  Deno.test(`napi finalizers run once when a Node worker ${terminate ? "terminates" : "exits"}`, async () => {
-    let expected = lib.test_worker_finalizer_count();
+  Deno.test(`napi Node worker shutdown (${mode})`, async () => {
+    let finalizers = lib.test_worker_finalizer_count();
+    let shutdowns = lib.test_worker_shutdown_count();
     for (let i = 0; i < 3; i++) {
       const worker = new NodeWorker(
         new URL("./node_worker_finalizer.js", import.meta.url),
-        { workerData: { hold: terminate } },
+        { workerData: { mode } },
       );
-      const exited = once(worker, "exit");
+      const errors = [];
+      worker.on("error", (error) => errors.push(error.message));
+      const exited = new Promise((resolve) => worker.once("exit", resolve));
       try {
         assertEquals((await once(worker, "message"))[0], "ready");
-        if (terminate) await worker.terminate();
+        if (mode === "terminate") await worker.terminate();
         await exited;
-        expected += 3;
-        await assertFinalizerCount(expected);
+        assertEquals(errors, mode === "error" ? ["worker shutdown error"] : []);
+        finalizers += 3;
+        shutdowns++;
+        await assertShutdown(finalizers, shutdowns);
       } finally {
         await worker.terminate();
       }
