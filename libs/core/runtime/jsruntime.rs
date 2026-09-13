@@ -1489,12 +1489,14 @@ impl JsRuntime {
       scope,
       global,
     );
-    let mod_id = module_map.new_synthetic_module(
-      scope,
-      VIRTUAL_OPS_MODULE_NAME,
-      crate::ModuleType::JavaScript,
-      synthetic_module_exports,
-    );
+    let mod_id = module_map
+      .new_synthetic_module(
+        scope,
+        VIRTUAL_OPS_MODULE_NAME,
+        crate::ModuleType::JavaScript,
+        synthetic_module_exports,
+      )
+      .expect("virtual ops module initialization");
     module_map.mod_evaluate_sync(scope, mod_id).unwrap();
   }
 

@@ -534,7 +534,7 @@ impl ModuleMap {
               module_url_found,
               ModuleType::Other(module_type.clone()),
               exports,
-            )
+            )?
           }
 
           // Complex case - besides a synthetic module, we will create a new
@@ -552,7 +552,7 @@ impl ModuleMap {
               url1,
               synthetic_module_type,
               exports,
-            );
+            )?;
 
             let (code_cache_info, url2) = if let Some(code_cache) = code_cache {
               let (url1, url2) = url2.into_cheap_copy();
@@ -603,7 +603,7 @@ impl ModuleMap {
     scope: &mut v8::PinScope<'s, 'i>,
     name: impl IntoModuleName,
     exports_obj: v8::Local<'s, v8::Object>,
-  ) -> ModuleId {
+  ) -> Result<ModuleId, ModuleError> {
     let name = name.into_module_name();
     let name_str = name.v8_string(scope).unwrap();
 
@@ -677,8 +677,9 @@ impl ModuleMap {
       vec![],
     );
 
-    // Synthetic modules have no imports so their instantation must never fail.
-    self.instantiate_module(scope, id).unwrap();
+    self
+      .instantiate_module(scope, id)
+      .map_err(ModuleError::Exception)?;
     // Eagerly evaluate so the `synthetic_module_evaluation_steps` callback
     // fires now (which sets the exports from the staged store) instead of
     // at first read. Important during snapshot creation: V8 needs the
@@ -693,7 +694,7 @@ impl ModuleMap {
       let _ = local.evaluate(scope);
     }
 
-    id
+    Ok(id)
   }
 
   /// Creates a "synthetic module", that contains only a single, "default" export.
@@ -705,7 +706,7 @@ impl ModuleMap {
     name: impl IntoModuleName,
     module_type: ModuleType,
     exports: Vec<(FastStaticString, v8::Local<'s, v8::Value>)>,
-  ) -> ModuleId {
+  ) -> Result<ModuleId, ModuleError> {
     let name = name.into_module_name();
     let name_str = name.v8_string(scope).unwrap();
 
@@ -746,10 +747,11 @@ impl ModuleMap {
       vec![],
     );
 
-    // Synthetic modules have no imports so their instantation must never fail.
-    self.instantiate_module(scope, id).unwrap();
+    self
+      .instantiate_module(scope, id)
+      .map_err(ModuleError::Exception)?;
 
-    id
+    Ok(id)
   }
 
   // TODO(bartlomieju): remove this method or rename it to `new_js_module`.
@@ -1106,13 +1108,9 @@ impl ModuleMap {
       }
     };
     let exports = vec![(ascii_str!("default"), parsed_json)];
-    Ok(self.new_synthetic_module(tc_scope, name, ModuleType::Json, exports))
+    self.new_synthetic_module(tc_scope, name, ModuleType::Json, exports)
   }
 
-  #[allow(
-    clippy::unnecessary_wraps,
-    reason = "consistent return type with other module constructors"
-  )]
   pub(crate) fn new_text_module(
     &self,
     scope: &mut v8::PinScope,
@@ -1132,13 +1130,9 @@ impl ModuleMap {
     let source_str_local = v8::Local::new(scope, source_str);
     let source_value_local = v8::Local::<v8::Value>::from(source_str_local);
     let exports = vec![(ascii_str!("default"), source_value_local)];
-    Ok(self.new_synthetic_module(scope, name, ModuleType::Text, exports))
+    self.new_synthetic_module(scope, name, ModuleType::Text, exports)
   }
 
-  #[allow(
-    clippy::unnecessary_wraps,
-    reason = "consistent return type with other module constructors"
-  )]
   pub(crate) fn new_bytes_module(
     &self,
     scope: &mut v8::PinScope,
@@ -1165,7 +1159,7 @@ impl ModuleMap {
     let uint8_array = v8::Uint8Array::new(scope, ab, 0, buf_len).unwrap();
     let value: v8::Local<v8::Value> = uint8_array.into();
     let exports = vec![(ascii_str!("default"), value)];
-    Ok(self.new_synthetic_module(scope, name, ModuleType::Bytes, exports))
+    self.new_synthetic_module(scope, name, ModuleType::Bytes, exports)
   }
 
   pub(crate) fn instantiate_module<'s, 'i>(

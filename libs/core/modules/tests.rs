@@ -3492,3 +3492,31 @@ async fn test_dyn_import_async_graph_with_lazy_esm_no_stall() {
   let v = g.get(scope, key.into()).unwrap();
   assert!(v.is_true(), "main.js await import never resolved");
 }
+
+#[test]
+fn synthetic_module_instantiation_can_be_terminated() {
+  let mut runtime = JsRuntime::new(RuntimeOptions::default());
+  let module_map = runtime.module_map().clone();
+  deno_core::scope!(scope, runtime);
+
+  let exports = v8::Object::new(scope);
+  scope.terminate_execution();
+  let result = module_map.new_synthetic_module_from_exports_object(
+    scope,
+    "ext:test/exports",
+    exports,
+  );
+  scope.cancel_terminate_execution();
+  assert!(matches!(result, Err(ModuleError::Exception(_))));
+
+  let value = v8::undefined(scope).into();
+  scope.terminate_execution();
+  let result = module_map.new_synthetic_module(
+    scope,
+    "ext:test/value",
+    ModuleType::JavaScript,
+    vec![(ascii_str!("default"), value)],
+  );
+  scope.cancel_terminate_execution();
+  assert!(matches!(result, Err(ModuleError::Exception(_))));
+}

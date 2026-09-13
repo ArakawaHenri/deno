@@ -486,11 +486,13 @@ impl ModuleMap {
         )))
       })?;
 
-    Ok(self.new_synthetic_module_from_exports_object(
-      scope,
-      String::from(specifier),
-      exports_obj,
-    ))
+    self
+      .new_synthetic_module_from_exports_object(
+        scope,
+        String::from(specifier),
+        exports_obj,
+      )
+      .map_err(|error| error.into_error(scope, false, true))
   }
 
   /// Convenience wrapper around `build_synthetic_esm_module` for the V8
