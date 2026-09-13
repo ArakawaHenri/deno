@@ -457,6 +457,8 @@ pub struct WebWorker {
 
 impl Drop for WebWorker {
   fn drop(&mut self) {
+    deno_napi::run_ref_finalizers(&mut self.js_runtime);
+
     // clean up the package.json thread local cache
     node_resolver::PackageJsonThreadLocalCache::clear();
 

@@ -483,6 +483,38 @@ pub struct NapiState {
 // on the same thread that created them.
 unsafe impl Send for NapiState {}
 
+/// Runs pending ref/wrap finalizers while the runtime's V8 isolate is alive.
+/// Taking registrations before invoking callbacks preserves the run-once contract.
+pub fn run_ref_finalizers(js_runtime: &mut deno_core::JsRuntime) {
+  let finalizers = {
+    let op_state = js_runtime.op_state();
+    let op_state = op_state.borrow();
+    match op_state.try_borrow::<NapiState>() {
+      Some(s) => s.ref_tracker.borrow_mut().take_pending(),
+      None => return,
+    }
+  };
+  if finalizers.is_empty() {
+    return;
+  }
+
+  // Call each finalizer in reverse (LIFO) order within a proper HandleScope
+  // so native addon code can use NAPI functions during cleanup. LIFO matches
+  // Node.js's linked list behavior (head insertion → reverse iteration).
+  {
+    deno_core::scope!(scope, js_runtime);
+    let _scope = v8::HandleScope::new(scope);
+    for f in finalizers.into_iter().rev() {
+      // SAFETY: The pointers (env, data, hint) were stored when the native
+      // addon called napi_wrap/napi_create_external/napi_add_finalizer and
+      // V8 is still alive (we have an active HandleScope).
+      unsafe {
+        (f.cb)(f.env, f.data, f.hint);
+      }
+    }
+  }
+}
+
 impl Drop for NapiState {
   fn drop(&mut self) {
     // External string resources can outlive their Env until V8 disposes the
@@ -526,8 +558,8 @@ impl Drop for NapiState {
     }
 
     // Note: remaining ref tracker entries are not finalized here because
-    // V8 is no longer alive. MainWorker::run_napi_ref_finalizers() handles
-    // this by calling finalizers directly while V8 is still alive.
+    // V8 is no longer alive. Workers call run_ref_finalizers before
+    // dropping their JsRuntime, while V8 can still service NAPI calls.
 
     // Call instance data finalize callbacks for all registered EnvShared instances.
     // Each entry should be unique since each op_napi_open creates a fresh EnvShared.

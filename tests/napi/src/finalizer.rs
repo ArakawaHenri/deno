@@ -2,6 +2,7 @@
 
 use std::ptr;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
 use napi_sys::ValueType::napi_object;
@@ -364,8 +365,106 @@ extern "C" fn test_external_finalizer_calls_js(
   result
 }
 
+static WORKER_FINALIZERS: AtomicU32 = AtomicU32::new(0);
+
+struct WorkerFinalizer {
+  reference: napi_ref,
+}
+
+enum WorkerFinalizerKind {
+  Wrap,
+  Added,
+  External,
+}
+
+unsafe extern "C" fn finalize_worker_value(
+  env: napi_env,
+  data: *mut std::ffi::c_void,
+  _hint: *mut std::ffi::c_void,
+) {
+  let data = unsafe { Box::from_raw(data.cast::<WorkerFinalizer>()) };
+  // Reference cleanup also verifies that the callback has a usable napi_env.
+  assert_napi_ok!(napi_delete_reference(env, data.reference));
+  WORKER_FINALIZERS.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn test_worker_finalizers(
+  env: napi_env,
+  _info: napi_callback_info,
+) -> napi_value {
+  let mut values = ptr::null_mut();
+  assert_napi_ok!(napi_create_array_with_length(env, 3, &mut values));
+  for (index, kind) in [
+    WorkerFinalizerKind::Wrap,
+    WorkerFinalizerKind::Added,
+    WorkerFinalizerKind::External,
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let data = Box::into_raw(Box::new(WorkerFinalizer {
+      reference: ptr::null_mut(),
+    }));
+    let mut value = ptr::null_mut();
+    if matches!(kind, WorkerFinalizerKind::External) {
+      assert_napi_ok!(napi_create_external(
+        env,
+        data.cast(),
+        Some(finalize_worker_value),
+        ptr::null_mut(),
+        &mut value
+      ));
+    } else {
+      assert_napi_ok!(napi_create_object(env, &mut value));
+      if matches!(kind, WorkerFinalizerKind::Wrap) {
+        assert_napi_ok!(napi_wrap(
+          env,
+          value,
+          data.cast(),
+          Some(finalize_worker_value),
+          ptr::null_mut(),
+          ptr::null_mut()
+        ));
+      } else {
+        assert_napi_ok!(napi_add_finalizer(
+          env,
+          value,
+          data.cast(),
+          Some(finalize_worker_value),
+          ptr::null_mut(),
+          ptr::null_mut()
+        ));
+      }
+    }
+    assert_napi_ok!(napi_create_reference(env, value, 0, unsafe {
+      &mut (*data).reference
+    }));
+    assert_napi_ok!(napi_set_element(env, values, index as u32, value));
+  }
+  values
+}
+
+extern "C" fn test_worker_finalizer_count(
+  env: napi_env,
+  _info: napi_callback_info,
+) -> napi_value {
+  let mut result = ptr::null_mut();
+  assert_napi_ok!(napi_create_uint32(
+    env,
+    WORKER_FINALIZERS.load(Ordering::SeqCst),
+    &mut result
+  ));
+  result
+}
+
 pub fn init(env: napi_env, exports: napi_value) {
   let properties = &[
+    napi_new_property!(env, "test_worker_finalizers", test_worker_finalizers),
+    napi_new_property!(
+      env,
+      "test_worker_finalizer_count",
+      test_worker_finalizer_count
+    ),
     napi_new_property!(
       env,
       "test_external_finalizer_calls_js",
